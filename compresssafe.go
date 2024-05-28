@@ -13,6 +13,12 @@ import (
 	"sync"
 )
 
+type FileStatus struct {
+	Path    string
+	Success bool
+	Error   error
+}
+
 func compressFile(inputFile, outputFile string) error {
 	in, err := os.Open(inputFile)
 	if err != nil {
@@ -85,68 +91,97 @@ func verifyIntegrity(originalFile, decompressedFile string) (bool, error) {
 	return originalChecksum == decompressedChecksum, nil
 }
 
-func compressAndVerify(inputFile string) error {
-	compressedFile := inputFile + ".gz"
-	decompressedFile := strings.TrimSuffix(inputFile, filepath.Ext(inputFile)) + "_decompressed" + filepath.Ext(inputFile)
+func processFile(path string, relativePath string, statuses *[]FileStatus, wg *sync.WaitGroup) {
+	defer wg.Done()
 
-	var wg sync.WaitGroup
-	var compressErr, decompressErr error
+	compressedFile := path + ".gz"
+	decompressedFile := filepath.Join("decompressed", relativePath)
 
-	// Compress file
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		compressErr = compressFile(inputFile, compressedFile)
-	}()
-
-	// Wait for compression to complete
-	wg.Wait()
-
+	compressErr := compressFile(path, compressedFile)
 	if compressErr != nil {
-		return fmt.Errorf("error compressing file: %v", compressErr)
+		*statuses = append(*statuses, FileStatus{Path: path, Success: false, Error: compressErr})
+		return
 	}
 
-	// Decompress file
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		decompressErr = decompressFile(compressedFile, decompressedFile)
-	}()
+	if err := os.MkdirAll(filepath.Dir(decompressedFile), os.ModePerm); err != nil {
+		*statuses = append(*statuses, FileStatus{Path: path, Success: false, Error: fmt.Errorf("error creating directories for %s: %v", decompressedFile, err)})
+		return
+	}
 
-	// Wait for decompression to complete
-	wg.Wait()
-
+	decompressErr := decompressFile(compressedFile, decompressedFile)
 	if decompressErr != nil {
-		return fmt.Errorf("error decompressing file: %v", decompressErr)
+		*statuses = append(*statuses, FileStatus{Path: path, Success: false, Error: decompressErr})
+		return
 	}
 
-	// Verify integrity by comparing checksums
-	valid, err := verifyIntegrity(inputFile, decompressedFile)
-	if err != nil {
-		return fmt.Errorf("error verifying integrity: %v", err)
+	valid, verifyErr := verifyIntegrity(path, decompressedFile)
+	if verifyErr != nil {
+		*statuses = append(*statuses, FileStatus{Path: path, Success: false, Error: verifyErr})
+		return
 	}
 
 	if valid {
-		fmt.Println("Verification successful: The decompressed file is identical to the original.")
+		*statuses = append(*statuses, FileStatus{Path: path, Success: true, Error: nil})
 	} else {
-		fmt.Println("Verification failed: The decompressed file is not identical to the original.")
+		*statuses = append(*statuses, FileStatus{Path: path, Success: false, Error: fmt.Errorf("verification failed")})
 	}
+}
+
+func compressAndVerify(inputPath string) error {
+	var wg sync.WaitGroup
+	var statuses []FileStatus
+
+	if fileInfo, err := os.Stat(inputPath); err == nil && fileInfo.IsDir() {
+		err := filepath.Walk(inputPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() && !strings.HasSuffix(path, ".gz") {
+				relativePath := strings.TrimPrefix(path, inputPath)
+				wg.Add(1)
+				go processFile(path, relativePath, &statuses, &wg)
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("error walking the path %s: %v", inputPath, err)
+		}
+	} else if !strings.HasSuffix(inputPath, ".gz") {
+		wg.Add(1)
+		go processFile(inputPath, filepath.Base(inputPath), &statuses, &wg)
+	} else {
+		fmt.Printf("Skipping already compressed file: %s\n", inputPath)
+	}
+
+	wg.Wait()
+
+	// Print summary
+	successCount := 0
+	for _, status := range statuses {
+		if status.Success {
+			successCount++
+		} else {
+			fmt.Printf("Error processing file %s: %v\n", status.Path, status.Error)
+		}
+	}
+
+	fmt.Printf("Processed %d files: %d successful, %d failed\n", len(statuses), successCount, len(statuses)-successCount)
 
 	return nil
 }
 
 func main() {
-	inputFile := flag.String("input", "", "Input file path")
+	inputPath := flag.String("input", "", "Input file or directory path")
 
 	flag.Parse()
 
-	if *inputFile == "" {
-		fmt.Println("Input file path is required.")
+	if *inputPath == "" {
+		fmt.Println("Input file or directory path is required.")
 		flag.Usage()
 		return
 	}
 
-	if err := compressAndVerify(*inputFile); err != nil {
+	if err := compressAndVerify(*inputPath); err != nil {
 		fmt.Printf("Error: %v\n", err)
 	}
 }
