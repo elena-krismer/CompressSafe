@@ -167,6 +167,11 @@ func compressAndVerify(inputPath string) error {
 
 	fmt.Printf("Processed %d files: %d successful, %d failed\n", len(statuses), successCount, len(statuses)-successCount)
 
+	// Remove decompressed directory
+	if err := os.RemoveAll(decompressedDir); err != nil {
+		return fmt.Errorf("error removing decompressed directory: %v", err)
+	}
+
 	return nil
 }
 
